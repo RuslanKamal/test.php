@@ -1,0 +1,361 @@
+composer create-project --prefer-dist laravel/laravel simpleblog
+composer require laravel/sanctum
+public function up()
+{
+    Schema::create('users', function (Blueprint $table) {
+        $table->id();
+        $table->string('name');
+        $table->string('email')->unique();
+        $table->timestamp('email_verified_at')->nullable();
+        $table->string('password');
+        $table->tinyInteger('role')->default(1); // <---- добавьте это
+        $table->rememberToken();
+        $table->timestamps();
+    });
+}
+
+php artisan vendor:publish --provider="Laravel\Sanctum\SanctumServiceProvider"
+php artisan migrate
+
+// добавим трейт Laravel\Sanctum\HasApiTokens в модель User и заменим свойство $fillable следующим:
+
+use Laravel\Sanctum\HasApiTokens;
+class User extends Authenticatable
+{
+ use HasFactory, Notifiable, HasApiTokens;
+ // --------------------------------↑
+ protected $fillable = [
+    'name',
+    'email',
+    'password',
+    'role'
+];
+
+// создадим роли: Admin (Администратор), Writer (Автор) и Subscriber (Подписчик). И следующие конечные точки REST API:
+
+GET /posts (список всех сообщений) — доступ есть только у Admin
+GET /posts/:id (получить сообщение) — доступ Admin, Writer и Subscriber
+POST /posts (добавить новое сообщение) — доступ Admin и Writer
+PUT /post/:id (обновление сообщения) — доступ Admin и Writer
+DELETE /posts/:id (удалить сообщение) — доступ Admin и Writer
+POST /users/writer (добавить пользователя с ролью Writer) — доступ Admin
+POST /users/subscriber (добавить пользователя с ролью Subscriber) — доступ Admin
+DELETE /user/:id (удалить пользователя) — доступ Admin
+
+php artisan make:model Post -m
+public function up()
+{
+    Schema::create('posts', function (Blueprint $table) {
+        $table->id();
+        $table->string('title');
+        $table->string('slug')->unique();
+        $table->longText('content');
+        $table->timestamps();
+    });
+}
+
+php artisan migrate
+
+// Для начала установим Laravel UI через Composer:
+composer require laravel/ui
+php artisan ui:auth
+
+php artisan make:middleware RestrictRegistrationToOneAdmin
+// Эта команда создаст мидлвар и поместит его в папку app/Htpp/Middleware. В появившемся файле RestrictRegistrationToOneAdmin.php добавьте в метод handle() следующее:
+
+public function handle(Request $request, Closure $next)
+{
+    $user = DB::table('users')->select('role')->where('id',1)->first();
+    if ($user && (int)$user->role === 1){
+        // редиректим на главную страницу, если у нас уже есть пользователь с такой ролью
+        return redirect("/");
+    }
+    return $next($request);
+}
+
+// мидлвар добавим к регистрационному маршруту, но перед этим назначим ему ключ в файле в файле app/Http/Kernel.php:
+
+protected $routeMiddleware = [
+    // здесь другие мидлвары
+    // ...
+    'verified' => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,
+    'restrictothers' => RestrictRegistrationToOneAdmin::class // <— добавим это
+];
+
+use App\Http\Controllers\Auth\RegisterController;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Route;
+Auth::routes();
+// Добавьте это ↓
+Route::post('register', [RegisterController::class, 'register'])
+    ->middleware('restrictothers');
+// Страница создания токена
+Route::get('dashboard', function () {
+    if(Auth::check() && Auth::user->role === 1){
+        return auth()
+            ->user()
+            ->createToken('auth_token', ['admin'])
+            ->plainTextToken;
+    }
+    return redirect("/");
+})->middleware('auth');
+
+// Как только вы зарегистрируетесь или войдете в систему как администратор, то будете перенаправлены на страницу панели управления. В замыкании мы проверяем, аутентифицирован ли пользователь и является ли он администратором. Если да, то создаем и возвращаем API-токен.
+
+После того, как вы это добавили, нужно очистить кеш маршрута в консоли, выполнив следующую команду:
+php artisan route:cache
+
+// Чтобы иметь возможность отзывать (удалять) токен, вы можете сделать в файле routes/web.php следующее:
+
+Route::get('clear/token', function () {
+    if(Auth::check() && Auth::user()->role === 1) {
+        Auth::user()->tokens()->delete();
+    }
+    return 'Token Cleared';
+})->middleware('auth');
+
+// Создание конечной точки API
+use App\Http\Controllers\ControllerExample;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Route;
+Route::group(['middleware' => 'auth:sanctum'], function() {
+    // список всех сообщений
+    Route::get('posts', [ControllerExample::class, 'post']);
+    // получить сообщение
+    Route::get('posts/{id}', [ControllerExample::class, 'singlePost']);
+    // добавить сообщение
+    Route::post('posts', [ControllerExample::class, 'createPost']);
+    // обновить сообщение
+    Route::put('posts/{id}', [ControllerExample::class, 'updatePost']);
+    // удалить сообщение
+    Route::delete('posts/{id}', [ControllerExample::class, 'deletePost']);
+    // добавить нового пользователя с ролью Writer
+    Route::post('users/writer', [ControllerExample::class, 'createWriter']);
+    // добавить нового пользователя с Subscriber 
+    Route::post(
+        'users/subscriber',
+        [ControllerExample::class, 'createSubscriber']
+    );
+    // удалить пользователя
+    Route::delete('users/{id}', [ControllerExample::class, 'deleteUser']);
+});
+
+// Перед созданием методов давайте сначала создадим трейт AiHelpers.php для общих функций. Создаем папку с Library в каталоге app/Http и поместим туда файл со следующими методами:
+
+namespace App\Http\Library;
+use Illuminate\Http\JsonResponse;
+trait ApiHelpers
+{
+    protected function isAdmin($user): bool
+    {
+        if (!empty($user)) {
+            return $user->tokenCan('admin');
+        }
+        return false;
+    }
+    protected function isWriter($user): bool
+    {
+        if (!empty($user)) {
+            return $user->tokenCan('writer');
+        }
+        return false;
+    }
+    protected function isSubscriber($user): bool
+    {
+        if (!empty($user)) {
+            return $user->tokenCan('subscriber');
+        }
+        return false;
+    }
+    protected function onSuccess($data, string $message = '', int $code = 200): JsonResponse
+    {
+        return response()->json([
+            'status' => $code,
+            'message' => $message,
+            'data' => $data,
+        ], $code);
+    }
+    protected function onError(int $code, string $message = ''): JsonResponse
+    {
+        return response()->json([
+            'status' => $code,
+            'message' => $message,
+        ], $code);
+    }
+    protected function postValidationRules(): array
+    {
+        return [
+            'title' => 'required|string',
+            'content' => 'required|string',
+        ];
+    }
+    protected function userValidatedRules(): array
+    {
+        return [
+            'name' => ['required', 'string', 'max:255'],
+            'email' => ['required', 'string', 'email', 'max:255', 'unique:users'],
+            'password' => ['required', 'string', 'min:8', 'confirmed'],
+        ];
+    }
+}
+
+// Все методы в вышеприведенном трейте в принципе понятны, однако в isAdmin , isWriter и isSubscriber я использовал метод tokenCan — это метод Sanctum, который проверяет, имеет ли токен указанную роль, в этом случае он возращает true.
+
+Мы задали роль admin при создании пользователя-администратора, мы также должны задавать роль writer при регистрации пользователей-писателей и роль subscriber при регистрации пользователей-подписчиков.
+
+namespace App\Http\Controllers;
+use App\Http\Library\ApiHelpers;
+use App\Models\Post;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Str;
+class ControllerExample extends Controller
+{
+    use ApiHelpers; // <---- Использование трейта apiHelpers
+    public function post(Request $request): JsonResponse
+    {
+        if ($this->isAdmin($request->user())) {
+            $post = DB::table('posts')->get();
+            return $this->onSuccess($post, 'Post Retrieved');
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function singlePost(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user) || $this->isWriter($user) || $this->isSubscriber($user)) {
+            $post = DB::table('posts')->where('id', $id)->first();
+            if (!empty($post)) {
+                return $this->onSuccess($post, 'Post Retrieved');
+            }
+            return $this->onError(404, 'Post Not Found');
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function createPost(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user) || $this->isWriter($user)) {
+            $validator = Validator::make($request->all(), $this->postValidationRules());
+            if ($validator->passes()) {
+                // Создание нового сообщения
+                $post = new Post();
+                $post->title = $request->input('title');
+                $post->slug = Str::slug($request->input('title'));
+                $post->content = $request->input('content');
+                $post->save();
+                return $this->onSuccess($post, 'Post Created');
+            }
+            return $this->onError(400, $validator->errors());
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function updatePost(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user) || $this->isWriter($user)) {
+            $validator = Validator::make($request->all(), $this->postValidationRules());
+            if ($validator->passes()) {
+                // Обновление сообщения
+                $post = Post::find($id);
+                $post->title = $request->input('title');
+                $post->content = $request->input('content');
+                $post->save();
+                return $this->onSuccess($post, 'Post Updated');
+            }
+            return $this->onError(400, $validator->errors());
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function deletePost(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user) || $this->isWriter($user)) {
+            $post = Post::find($id); // Найдем id сообщения
+            $post->delete(); // Удаляем указанное сообщение
+            if (!empty($post)) {
+                return $this->onSuccess($post, 'Post Deleted');
+            }
+            return $this->onError(404, 'Post Not Found');
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function createWriter(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user)) {
+            $validator = Validator::make($request->all(), $this->userValidatedRules());
+            if ($validator->passes()) {
+                // Создаем нового Автора
+                User::create([
+                    'name' => $request->input('name'),
+                    'email' => $request->input('email'),
+                    'role' => 2,
+                    'password' => Hash::make($request->input('password')),
+                ]);
+                $writerToken = $user->createToken('auth_token', ['writer'])->plainTextToken;
+                return $this->onSuccess($writerToken, 'User Created With Writer Privilege');
+            }
+            return $this->onError(400, $validator->errors());
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function createSubscriber(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user)) {
+            $validator = Validator::make($request->all(), $this->userValidatedRules());
+            if ($validator->passes()) {
+                // Создаем нового Подписчика
+                User::create([
+                    'name' => $request->input('name'),
+                    'email' => $request->input('email'),
+                    'role' => 3,
+                    'password' => Hash::make($request->input('password')),
+                ]);
+                $writerToken = $user->createToken('auth_token', ['subscriber'])->plainTextToken;
+                return $this->onSuccess($writerToken, 'User Created With Subscriber Privilege');
+            }
+            return $this->onError(400, $validator->errors());
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+    public function deleteUser(Request $request, $id): JsonResponse
+    {
+        $user = $request->user();
+        if ($this->isAdmin($user)) {
+            $user = User::find($id); // Найдем id пользователя
+            if ($user->role !== 1) {
+                $user->delete(); // Удалим указанного пользователя
+                if (!empty($user)) {
+                    return $this->onSuccess('', 'User Deleted');
+                }
+                return $this->onError(404, 'User Not Found');
+            }
+        }
+        return $this->onError(401, 'Unauthorized Access');
+    }
+}
+
+Объясню, что делает каждый метод:
+
+post(Request $request)
+Проверяет, является ли пользователь администратором. Если да, то выводим все сообщения. В противном случае возвращаем ошибку авторизации.
+singlePost(Request $request, $id)
+Проверяет, является ли пользователь администратором, автором или подписчиком. Если да, то показываем запрошенное сообщение. Если сообщение не найдено, то возвращаем ошибку 404.
+createPost(Request $request)
+Возможность создать сообщение есть только у Администраторов и Авторов, поэтому проверяем является ли аутентифицированный пользователь одним из таковых. Если да, мы проводим валидацию данных и в случае успеха создаем новое сообщение. Если же нет, то возвращаем ошибку. Если пользователь не имеет необходимой роли, то возращаем ошибку авторизации.
+updatePost(Request $request, $id)
+Также как в методе createPost, за исключением того, что мы просто обновляем данные указанного сообщения.
+deletePost(Request $request, $id)
+Также как в методе createPost, за исключением того, что мы удаляем указанное сообщение.
+createWriter(Request $request)
+Возможность создавать Авторов есть только у Администратора, поэтому проверяем является ли аутентифицированный пользователь таковым. Если да, то создаем нового пользователя с ролью 2 (в нашем случае это значит Автор). Самое главное, что как только пользователь создан, мы возвращаем токен и отмечаем его как Авторский (Writer).
+createSubscriber(Request $request)
+Подобен методу createWriter, за исключением того, что на этот раз мы отмечаем его как Подписочный (subscriber).
+deleteUser(Request $request, $id)
+Сначала проверяется, авторизован ли пользователь как администратор. Страхуемся от удаления пользователя с ролью администратора (вы можете это изменить). Если всё в порядке, то удаляем пользователя.
